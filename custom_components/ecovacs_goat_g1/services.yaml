@@ -5,6 +5,22 @@ refresh_state:
     entity:
       integration: ecovacs_goat_g1
 
+mow_area:
+  name: Mow area
+  description: Mow only the given lawn areas, like area mowing in the ECOVACS app. Area ids are listed in the live map sensor attribute info.lawn_ids.
+  target:
+    entity:
+      integration: ecovacs_goat_g1
+      domain: lawn_mower
+  fields:
+    areas:
+      name: Areas
+      description: One area id, a comma list such as "1,2", or a list.
+      required: true
+      example: "2"
+      selector:
+        text:
+
 request_live_position_stream:
   name: Request live position stream
   description: Request app-style fast live position updates while a live map is being viewed.

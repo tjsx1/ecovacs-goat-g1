@@ -265,7 +265,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             self._saved_position_history = self.data.map.position_history
             self._saved_outline = self.data.map.info.outline
             self._saved_obstacles = self.data.map.info.obstacles
-        lawns, lanes, edges = await self._async_load_saved_rtk_layers()
+        lawns, lanes, edges, lawn_ids = await self._async_load_saved_rtk_layers()
         if lawns or lanes or edges:
             # O-series geometry only arrives while the mower drives; without
             # this the map stays empty after every restart until the next mow.
@@ -273,7 +273,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 self.data,
                 map=replace(
                     self.data.map,
-                    info=replace(self.data.map.info, lawns=lawns),
+                    info=replace(self.data.map.info, lawns=lawns, lawn_ids=lawn_ids),
                     trace=replace(self.data.map.trace, lanes=lanes, edges=edges),
                 ),
             )
@@ -408,11 +408,12 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         tuple[tuple[MapPosition, ...], ...],
         dict[str, tuple[tuple[int, int, int, int], ...]],
         tuple[tuple[MapPosition, ...], ...],
+        tuple[str, ...],
     ]:
         """Restore O-series lawns and the last mowed lanes from HA storage."""
         stored = await self._map_history_store.async_load()
         if not isinstance(stored, dict):
-            return (), {}, ()
+            return (), {}, (), ()
         polygons = lambda items: tuple(  # noqa: E731
             polygon
             for item in (items if isinstance(items, list) else [])
@@ -435,14 +436,26 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 )
                 if valid:
                     lanes[str(key)] = valid
-        return polygons(stored.get("lawns")), lanes, polygons(stored.get("edges"))
+        lawns = polygons(stored.get("lawns"))
+        raw_ids = stored.get("lawn_ids")
+        lawn_ids = (
+            tuple(str(item) for item in raw_ids)
+            if isinstance(raw_ids, list) and len(raw_ids) == len(lawns)
+            else ()
+        )
+        return lawns, lanes, polygons(stored.get("edges")), lawn_ids
 
     @staticmethod
     def _rtk_layers(data: MowerState | None) -> tuple[Any, ...]:
         """Return the O-series layers that are worth persisting."""
         if data is None:
-            return ((), {}, ())
-        return (data.map.info.lawns, data.map.trace.lanes, data.map.trace.edges)
+            return ((), (), {}, ())
+        return (
+            data.map.info.lawns,
+            data.map.info.lawn_ids,
+            data.map.trace.lanes,
+            data.map.trace.edges,
+        )
 
     @staticmethod
     def _positions_from_stored(items: Any) -> tuple[MapPosition, ...]:
@@ -504,6 +517,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
                 [position.as_dict() for position in polygon]
                 for polygon in (map_state.info.lawns if map_state else ())
             ],
+            "lawn_ids": list(map_state.info.lawn_ids if map_state else ()),
             "lanes": {
                 key: [list(segment) for segment in segments]
                 for key, segments in (map_state.trace.lanes if map_state else {}).items()
@@ -1554,6 +1568,34 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._ensure_mowing_position_refresh()
         self._schedule_outcome_poll(
             "start_mowing", lambda state: state.activity is MowerActivity.MOWING
+        )
+
+    async def start_area_mowing(self, areas: list[str]) -> None:
+        """Mow only the given lawn areas, like "Bereichsmähen" in the app.
+
+        Captured from the app on a GOAT O1200 LiDAR Pro: the mower then reports
+        ``cleanState.content = {"type": "spotArea", "value": "2"}``. Several
+        areas are joined with commas, as the deebot vacuums do.
+        """
+        await self.async_refresh_if_stale()
+        await self.control(
+            self._capability.clean_command,
+            {
+                "act": "start",
+                "content": {"type": "spotArea", "value": ",".join(areas)},
+            },
+            refresh_if_stale=False,
+        )
+        self.async_set_updated_data(
+            replace(
+                self.data,
+                activity=MowerActivity.MOWING,
+                map=replace(self.data.map, position_history=()),
+            )
+        )
+        self._ensure_mowing_position_refresh()
+        self._schedule_outcome_poll(
+            "start_area_mowing", lambda state: state.activity is MowerActivity.MOWING
         )
 
     async def pause(self) -> None:

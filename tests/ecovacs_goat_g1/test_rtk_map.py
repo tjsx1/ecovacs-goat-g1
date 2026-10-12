@@ -63,6 +63,7 @@ def test_lawns_obstacles_and_lanes() -> None:
     for chunk in _chunks(lawns, pieces=2):
         state = apply_command_data(state, "onMI", chunk)
     assert len(state.map.info.lawns) == 2
+    assert state.map.info.lawn_ids == ("1", "2")
     assert {p.x for p in state.map.info.outline} == {0, 1000}  # largest lawn
 
     obstacles = [["1", "1", "0"], ["1", "3", "1", "100;200,-200;4(2)6(2)8(2)2(2)"]]
@@ -88,3 +89,19 @@ def test_geometry_mid_does_not_reset_map() -> None:
     state = apply_command_data(state, "onPos", {"mid": "0", "deebotPos": {"x": 3, "y": 4}})
     assert state.map.info.lawns
     assert state.map.mid == "0"
+
+
+def test_mow_area_schema_accepts_id_list_and_string() -> None:
+    import voluptuous as vol
+
+    schema = vol.Schema(
+        {
+            vol.Required("areas"): vol.All(
+                lambda value: value if isinstance(value, list) else str(value).split(","),
+                [vol.All(vol.Coerce(str), vol.Strip, vol.Match(r"^\d+$"))],
+                vol.Length(min=1),
+            )
+        }
+    )
+    assert schema({"areas": "1, 2"})["areas"] == ["1", "2"]
+    assert schema({"areas": [2]})["areas"] == ["2"]

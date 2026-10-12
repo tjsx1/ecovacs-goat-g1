@@ -212,6 +212,9 @@ class MowerMapInfo:
     # O-series (RTK) maps can hold several separate lawns; ``outline`` keeps
     # the largest one for older cards, ``lawns`` has all of them.
     lawns: tuple[tuple[MapPosition, ...], ...] = ()
+    # Area id of each lawn, same order as ``lawns`` — what ``spotArea`` mowing
+    # expects as ``value``.
+    lawn_ids: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -248,6 +251,7 @@ class MowerMapInfo:
                 ]
                 for lawn in self.lawns
             ],
+            "lawn_ids": list(self.lawn_ids),
         }
 
 

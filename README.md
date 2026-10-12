@@ -30,6 +30,7 @@ For O-series mowers the integration:
 - Detects the model and reports it on the **GOAT model line** diagnostic sensor (with `family`, `map_dialect`, and an `experimental` flag).
 - Drives the lawn mower entity, start/pause/resume/stop/dock controls, status, battery, error, and the **live position map** (mower marker + path) from the shared position stream.
 - Shows the **RTK base station** on the map (from `getRTK`) where the G1 line shows UWB beacons.
+- **Fork note (tjsx1, 1.3.0):** service `ecovacs_goat_g1.mow_area` (`areas: "2"` or `"1,2"`) mows single lawns like area mowing in the app (`clean` with `content: {type: "spotArea", value}`, captured from the app on an O1200 LiDAR Pro); the lawn ids are in the live map attribute `info.lawn_ids`.
 - **Fork note (tjsx1, 1.2.1–1.2.2):** lawns, lanes and edges are also kept in the map store, so the map survives a restart (1.2.2); draws the lawns (`onMI`), obstacles (`onArI`) and mowed lanes (`onMapTrack`) for the O1200 LiDAR Pro, decoded from a capture taken while mowing — see `_rtk_*` in `mower_messages.py`. Also stops geometry pushes (`mid` 1) from resetting the map against the position stream (`mid` 0).
 - **Upstream 1.2.0 did not** yet draw the completed-area outline, because the only available O-series capture was taken while docked (the map-trace command returns `fail` with no job running), so there is no validated geometry sample to decode. The map id is still learned so this can be finished later.
 - Avoids spamming `*_V2` map errors that the previous G1-only code produced on these mowers.

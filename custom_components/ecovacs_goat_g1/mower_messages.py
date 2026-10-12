@@ -972,6 +972,7 @@ def _rtk_lawn_data(current: MowerMap, command: str, data: dict[str, Any]) -> Mow
     if not isinstance(payload, list):
         return current
     lawns: list[tuple[MapPosition, ...]] = []
+    lawn_ids: list[str] = []
     for row in payload:
         if not isinstance(row, list):
             continue
@@ -984,12 +985,18 @@ def _rtk_lawn_data(current: MowerMap, command: str, data: dict[str, Any]) -> Mow
             lawn = _rtk_chain(parts[2], parts[3])
             if len(lawn) >= 3:
                 lawns.append(lawn)
+                lawn_ids.append(parts[0].lstrip("s"))
     if not lawns:
         return current
     outline = max(lawns, key=_polygon_area)
     return replace(
         current,
-        info=replace(current.info, outline=outline, lawns=tuple(lawns)),
+        info=replace(
+            current.info,
+            outline=outline,
+            lawns=tuple(lawns),
+            lawn_ids=tuple(lawn_ids),
+        ),
     )
 
 

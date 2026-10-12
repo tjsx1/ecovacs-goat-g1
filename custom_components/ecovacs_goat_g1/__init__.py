@@ -23,6 +23,7 @@ from .const import (
     SERVICE_CLEAR_DEBUG_CAPTURE,
     SERVICE_EXPORT_DEBUG_CAPTURE,
     SERVICE_MARK_DEBUG_CAPTURE,
+    SERVICE_MOW_AREA,
     SERVICE_REFRESH_STATE,
     SERVICE_REQUEST_LIVE_POSITION_STREAM,
     SERVICE_START_DEBUG_CAPTURE,
@@ -48,6 +49,17 @@ type EcovacsConfigEntry = ConfigEntry[EcovacsController]
 REFRESH_STATE_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+    }
+)
+MOW_AREA_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+        # One id, a comma list ("1,2") or a YAML list.
+        vol.Required("areas"): vol.All(
+            lambda value: value if isinstance(value, list) else str(value).split(","),
+            [vol.All(vol.Coerce(str), vol.Strip, vol.Match(r"^\d+$"))],
+            vol.Length(min=1),
+        ),
     }
 )
 REQUEST_LIVE_POSITION_STREAM_SCHEMA = vol.Schema(
@@ -165,6 +177,25 @@ def _async_register_services(hass: HomeAssistant) -> None:
             SERVICE_REFRESH_STATE,
             async_refresh_state,
             schema=REFRESH_STATE_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_MOW_AREA):
+
+        async def async_mow_area(call: ServiceCall) -> None:
+            """Mow only the given lawn areas (app: "Bereichsmähen")."""
+            coordinators = _coordinators_for_call(hass, call)
+            await asyncio.gather(
+                *(
+                    coordinator.start_area_mowing(list(call.data["areas"]))
+                    for coordinator in coordinators
+                )
+            )
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_MOW_AREA,
+            async_mow_area,
+            schema=MOW_AREA_SCHEMA,
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_REQUEST_LIVE_POSITION_STREAM):

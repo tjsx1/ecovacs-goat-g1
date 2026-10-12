@@ -9,6 +9,7 @@ CONF_ACCOUNT_UID = "account_uid"
 CONF_ACCESS_TOKEN = "access_token"
 
 SERVICE_REFRESH_STATE = "refresh_state"
+SERVICE_MOW_AREA = "mow_area"
 SERVICE_REQUEST_LIVE_POSITION_STREAM = "request_live_position_stream"
 SERVICE_START_DEBUG_CAPTURE = "start_debug_capture"
 SERVICE_STOP_DEBUG_CAPTURE = "stop_debug_capture"
