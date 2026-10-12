@@ -7,6 +7,7 @@ import binascii
 from dataclasses import replace
 import json
 import lzma
+import re
 from typing import Any
 
 from .mower_models import (
@@ -160,7 +161,11 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         MowerActivity.PAUSED,
                     }
                 ):
-                    mower_map = replace(mower_map, position_history=())
+                    mower_map = replace(
+                        mower_map,
+                        position_history=(),
+                        trace=replace(mower_map.trace, lanes={}, edges=()),
+                    )
                 state = replace(
                     state,
                     activity=activity,
@@ -181,7 +186,11 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         MowerActivity.PAUSED,
                     }
                 ):
-                    mower_map = replace(mower_map, position_history=())
+                    mower_map = replace(
+                        mower_map,
+                        position_history=(),
+                        trace=replace(mower_map.trace, lanes={}, edges=()),
+                    )
                 state = replace(
                     state,
                     activity=activity,
@@ -257,7 +266,16 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
             # wrapper used by the G1 V2 map, so it decodes with the shared
             # decoder.
             if isinstance(data, dict):
-                state = replace(state, map=_map_set_layer(state.map, data))
+                if command in {"getMapTrack", "onMapTrack"} and "info" in data:
+                    # O1200 LiDAR Pro: the mowed track arrives as chunked
+                    # ``info`` (not ``subsets``) on the same command name.
+                    state = replace(state, map=_rtk_track_data(state.map, command, data))
+                else:
+                    state = replace(state, map=_map_set_layer(state.map, data))
+        case "getArI" | "onArI":
+            # O-series obstacles ("areas of interest"), chain-coded outlines.
+            if isinstance(data, dict):
+                state = replace(state, map=_rtk_obstacle_data(state.map, command, data))
         case (
             "getMapState"
             | "onMapState"
@@ -273,7 +291,17 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
             # learn the map id here; the live marker comes from getPos/onPos
             # (deebotPos + rtkPos).
             if isinstance(data, dict):
-                state = replace(state, map=_map_mid_only(state.map, data))
+                if "info" in data:
+                    # Geometry pushes (O1200 LiDAR Pro) carry the map-set id
+                    # (``mid`` 1) while the position stream reports ``mid`` 0.
+                    # Writing it as the active id would make the next onPos
+                    # look like a remap and wipe the geometry again.
+                    if command in {"getMI", "onMI"}:
+                        state = replace(
+                            state, map=_rtk_lawn_data(state.map, command, data)
+                        )
+                else:
+                    state = replace(state, map=_map_mid_only(state.map, data))
         case "getRTK" | "onRTK":
             # O-series RTK reference: the fixed base station position. There is
             # one station; show it where the G1 shows UWB beacons.
@@ -812,6 +840,236 @@ def _map_set_layer(current: MowerMap, data: dict[str, Any]) -> MowerMap:
     elif layer_type == "vw":
         new = replace(new, no_go_zones=_no_go_zone_polygons(decoded))
     return new
+
+
+# --- O-series (RTK) map geometry -------------------------------------------
+#
+# Decoded from a capture of a GOAT O1200 LiDAR Pro (fw 1.13.10) while mowing.
+# ``onMI`` / ``onArI`` / ``onMapTrack`` carry their geometry in ``info``: the
+# same base64 + compact-LZMA wrapper as the G1 map, split into ``serial``
+# pieces that share a ``batid``.
+#
+# Outlines are chain codes ``<x>,<y>;<code>``: one digit per 50 mm step, a
+# trailing ``(n)`` repeats only the digit right before it. Digit ``d`` moves in
+# direction ``RTK_CHAIN_DIRECTIONS[d - 1]``. Validated against the mowed
+# lanes of the same run (99 % of the track points fall inside the lawn).
+
+RTK_CHAIN_STEP_MM = 50
+RTK_CHAIN_DIRECTIONS: tuple[tuple[int, int], ...] = (
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+    (1, 0),
+    (1, -1),
+    (0, -1),
+    (-1, -1),
+    (-1, 0),
+)
+RTK_SIMPLIFY_TOLERANCE_MM = 40
+_RTK_CHAIN_TOKEN = re.compile(r"(\d+)(?:\((\d+)\))?")
+
+
+def _rtk_collect_chunks(
+    current: MowerMap, command: str, data: dict[str, Any]
+) -> tuple[MowerMap, Any]:
+    """Buffer one chunk; return the decoded payload once all pieces arrived."""
+    info = data.get("info")
+    if not isinstance(info, str) or not info:
+        return current, None
+    total = _int(data.get("serial")) or 1
+    index = _int(data.get("index")) or 0
+    key = f"{command.removeprefix('on').removeprefix('get')}:{data.get('batid')}"
+    pending = {k: dict(v) for k, v in current.pending_chunks.items()}
+    chunks = pending.setdefault(key, {})
+    chunks[index] = info
+    if len(chunks) < total:
+        # Keep the buffer small: a lost piece must not pin memory forever.
+        if len(pending) > 8:
+            for stale in list(pending)[:-8]:
+                pending.pop(stale, None)
+        return replace(current, pending_chunks=pending), None
+    pending.pop(key, None)
+    current = replace(current, pending_chunks=pending)
+    try:
+        return current, _decode_lzma_json_chunks(chunks)
+    except (binascii.Error, ValueError, lzma.LZMAError, json.JSONDecodeError):
+        return current, None
+
+
+def _rtk_chain(start: str, code: str) -> tuple[MapPosition, ...]:
+    """Expand an O-series chain code into map positions (mm)."""
+    try:
+        x_text, y_text = start.split(",")[:2]
+        x, y = int(x_text), int(y_text)
+    except ValueError:
+        return ()
+    points = [(x, y)]
+    for match in _RTK_CHAIN_TOKEN.finditer(code):
+        digits, repeat = match.group(1), int(match.group(2) or 1)
+        steps = list(digits[:-1]) + [digits[-1]] * repeat
+        for digit in steps:
+            number = int(digit)
+            if not 1 <= number <= 8:
+                continue
+            dx, dy = RTK_CHAIN_DIRECTIONS[number - 1]
+            x += dx * RTK_CHAIN_STEP_MM
+            y += dy * RTK_CHAIN_STEP_MM
+            points.append((x, y))
+    return tuple(
+        MapPosition(x=px, y=py)
+        for px, py in _simplify(points, RTK_SIMPLIFY_TOLERANCE_MM)
+    )
+
+
+def _simplify(
+    points: list[tuple[int, int]], tolerance: float
+) -> list[tuple[int, int]]:
+    """Douglas-Peucker without recursion; chain codes have many tiny steps."""
+    if len(points) < 3:
+        return points
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        first, last = stack.pop()
+        (x1, y1), (x2, y2) = points[first], points[last]
+        dx, dy = x2 - x1, y2 - y1
+        length = (dx * dx + dy * dy) ** 0.5
+        worst, worst_index = 0.0, -1
+        for index in range(first + 1, last):
+            px, py = points[index]
+            if length:
+                distance = abs(dy * px - dx * py + x2 * y1 - y2 * x1) / length
+            else:
+                distance = ((px - x1) ** 2 + (py - y1) ** 2) ** 0.5
+            if distance > worst:
+                worst, worst_index = distance, index
+        if worst > tolerance and worst_index > 0:
+            keep[worst_index] = True
+            stack.append((first, worst_index))
+            stack.append((worst_index, last))
+    return [point for point, kept in zip(points, keep) if kept]
+
+
+def _polygon_area(points: tuple[MapPosition, ...]) -> float:
+    return abs(
+        sum(
+            a.x * b.y - b.x * a.y
+            for a, b in zip(points, (*points[1:], points[:1][0]))
+        )
+    ) / 2 if points else 0.0
+
+
+def _rtk_lawn_data(current: MowerMap, command: str, data: dict[str, Any]) -> MowerMap:
+    """Apply ``onMI``: one chain-coded outline per lawn.
+
+    Shape: ``[["1", "s1;1;<x>,<y>;<code>", "2;1;<x>,<y>;<code>"], ["2", "1"]]``
+    — the first row lists the lawns as ``<id>;<flag>;<start>;<code>`` (the
+    first id carries an ``s`` prefix). A lawn without geometry reads
+    ``<id>;0;``.
+    """
+    current, payload = _rtk_collect_chunks(current, command, data)
+    if not isinstance(payload, list):
+        return current
+    lawns: list[tuple[MapPosition, ...]] = []
+    for row in payload:
+        if not isinstance(row, list):
+            continue
+        for field_value in row[1:]:
+            if not isinstance(field_value, str):
+                continue
+            parts = field_value.split(";")
+            if len(parts) < 4 or "," not in parts[2]:
+                continue
+            lawn = _rtk_chain(parts[2], parts[3])
+            if len(lawn) >= 3:
+                lawns.append(lawn)
+    if not lawns:
+        return current
+    outline = max(lawns, key=_polygon_area)
+    return replace(
+        current,
+        info=replace(current.info, outline=outline, lawns=tuple(lawns)),
+    )
+
+
+def _rtk_obstacle_data(
+    current: MowerMap, command: str, data: dict[str, Any]
+) -> MowerMap:
+    """Apply ``onArI``: obstacle outlines per lawn.
+
+    Rows are ``[<lawn>, <layer>, <count>, "<id>;<x>,<y>;<code>", ...]``; layer
+    ``3`` holds the obstacles, the other layers were empty in the capture.
+    """
+    current, payload = _rtk_collect_chunks(current, command, data)
+    if not isinstance(payload, list):
+        return current
+    obstacles: list[tuple[MapPosition, ...]] = []
+    for row in payload:
+        if not isinstance(row, list) or len(row) < 4 or str(row[1]) != "3":
+            continue
+        for field_value in row[3:]:
+            if not isinstance(field_value, str):
+                continue
+            parts = field_value.split(";")
+            if len(parts) < 3:
+                continue
+            obstacle = _rtk_chain(parts[1], parts[2])
+            if len(obstacle) >= 3:
+                obstacles.append(obstacle)
+    return replace(current, info=replace(current.info, obstacles=tuple(obstacles)))
+
+
+def _rtk_track_data(
+    current: MowerMap, command: str, data: dict[str, Any]
+) -> MowerMap:
+    """Apply ``onMapTrack``: the mowed lanes of the running job.
+
+    Payload rows are ``[<lawn>, <kind>, "<lawn>;<type>;<lane>;<points>", ...]``.
+    Kind ``1`` is a full snapshot (replaces everything), kind ``2`` updates
+    single lanes. Type ``1`` is a straight lane whose points come in pairs —
+    each pair one mowed segment, gaps are obstacles. Type ``2`` is the edge
+    cut as a chain code.
+    """
+    current, payload = _rtk_collect_chunks(current, command, data)
+    if not isinstance(payload, list):
+        return current
+    trace = current.trace
+    lanes = dict(trace.lanes)
+    edges = list(trace.edges)
+    for row in payload:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        if str(row[1]) == "1":
+            lanes, edges = {}, []
+        for field_value in row[2:]:
+            if not isinstance(field_value, str):
+                continue
+            parts = field_value.split(";")
+            if len(parts) < 4:
+                continue
+            lawn_id, kind, lane_id = parts[0], parts[1], parts[2]
+            if kind == "2":
+                edge = _rtk_chain(parts[3], parts[4] if len(parts) > 4 else "")
+                if len(edge) >= 2:
+                    edges.append(edge)
+                continue
+            coords: list[tuple[int, int]] = []
+            for point in parts[3:]:
+                if "," not in point:
+                    continue
+                try:
+                    x_text, y_text = point.split(",")[:2]
+                    coords.append((int(x_text), int(y_text)))
+                except ValueError:
+                    continue
+            segments = tuple(
+                (*coords[index], *coords[index + 1])
+                for index in range(0, len(coords) - 1, 2)
+            )
+            if segments:
+                lanes[f"{lawn_id}:{kind}:{lane_id}"] = segments
+    return replace(current, trace=replace(trace, lanes=lanes, edges=tuple(edges)))
 
 
 def _decode_map_subset(value: Any) -> Any:

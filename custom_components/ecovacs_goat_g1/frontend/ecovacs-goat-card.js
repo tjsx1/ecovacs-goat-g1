@@ -243,6 +243,13 @@ const STYLE = `
     fill: #4f9a43;
     opacity: 0.9;
   }
+  .map-mowed-lanes {
+    fill: none;
+    stroke: #b9ee98;
+    stroke-linecap: butt;
+    stroke-linejoin: round;
+    opacity: 0.55;
+  }
   .map-obstacle {
     fill: #dfe5ec;
     opacity: 0.95;
@@ -1022,6 +1029,8 @@ class EcovacsGoatCard extends HTMLElement {
     ) {
       delete model.position_history;
       delete model.tracePath;
+      delete model.lanes;
+      delete model.edges;
     }
 
     const hasAttributes =
@@ -1043,6 +1052,9 @@ class EcovacsGoatCard extends HTMLElement {
       };
 
       keep("outline", liveInfo.outline?.length ? liveInfo.outline : staticInfo.outline);
+      keep("lawns", liveInfo.lawns?.length ? liveInfo.lawns : staticInfo.lawns);
+      keep("lanes", map.trace?.lanes);
+      keep("edges", map.trace?.edges);
       keep(
         "obstacles",
         liveInfo.obstacles?.length ? liveInfo.obstacles : staticInfo.obstacles
@@ -1059,6 +1071,8 @@ class EcovacsGoatCard extends HTMLElement {
 
     const hasGeometry = Boolean(
       model.outline?.length ||
+        model.lawns?.length ||
+        model.lanes?.length ||
         model.obstacles?.length ||
         model.charge_positions?.length ||
         model.uwb_positions?.length ||
@@ -1073,6 +1087,9 @@ class EcovacsGoatCard extends HTMLElement {
     return {
       available: hasAttributes || hasGeometry,
       outline: model.outline,
+      lawns: model.lawns,
+      lanes: model.lanes,
+      edges: model.edges,
       obstacles: model.obstacles,
       position_history: model.position_history,
       tracePath: model.tracePath,
@@ -1095,6 +1112,9 @@ class EcovacsGoatCard extends HTMLElement {
     return JSON.stringify([
       mowerState,
       resolved.outline,
+      resolved.lawns,
+      resolved.lanes,
+      resolved.edges,
       resolved.obstacles,
       resolved.position_history,
       resolved.tracePath,
@@ -1113,6 +1133,19 @@ class EcovacsGoatCard extends HTMLElement {
     }
 
     const garden = this._positions(resolved.outline);
+    // O-series maps can hold several lawns; draw all of them when present.
+    const lawns = this._polygons(resolved.lawns).filter((lawn) => lawn.length >= 3);
+    const lanes = (Array.isArray(resolved.lanes) ? resolved.lanes : [])
+      .filter((segment) => Array.isArray(segment) && segment.length >= 4)
+      .map((segment) => segment.map(Number))
+      .filter((segment) => segment.every(Number.isFinite));
+    const edges = (Array.isArray(resolved.edges) ? resolved.edges : [])
+      .map((edge) =>
+        (Array.isArray(edge) ? edge : [])
+          .filter((point) => Array.isArray(point) && point.length >= 2)
+          .map((point) => ({ x: Number(point[0]), y: Number(point[1]) }))
+      )
+      .filter((edge) => edge.length >= 2);
     const obstacles = this._polygons(resolved.obstacles);
     const livePath = this._positions(resolved.position_history);
     const tracePath = this._positions(resolved.tracePath);
@@ -1131,6 +1164,7 @@ class EcovacsGoatCard extends HTMLElement {
 
     const points = [
       ...garden,
+      ...lawns.flat(),
       ...obstacles.flat(),
       ...mowedArea,
       ...livePath,
@@ -1152,9 +1186,15 @@ class EcovacsGoatCard extends HTMLElement {
     // Static layers: only depend on the persistent geometry + viewport. When
     // these are unchanged we can patch the dynamic layers in place.
     const gardenPath = this._closedPath(garden, bounds, width, height);
-    const gardenMarkup = gardenPath
-      ? `<path class="map-garden" d="${gardenPath}"></path>`
-      : "";
+    const gardenMarkup = lawns.length
+      ? lawns
+          .map((lawn) => this._closedPath(lawn, bounds, width, height))
+          .filter(Boolean)
+          .map((path) => `<path class="map-garden" d="${path}"></path>`)
+          .join("")
+      : gardenPath
+        ? `<path class="map-garden" d="${gardenPath}"></path>`
+        : "";
     const obstacleMarkup = obstacles
       .map((obstacle) => this._closedPath(obstacle, bounds, width, height))
       .filter(Boolean)
@@ -1195,6 +1235,24 @@ class EcovacsGoatCard extends HTMLElement {
     // Dynamic layers: change on (almost) every position update.
     const mowedAreaPath = this._closedPath(mowedArea, bounds, width, height);
     const liveSvgPath = this._path(livePath, bounds, width, height);
+    const lanesSvgPath = [
+      ...lanes.map((segment) =>
+        this._path(
+          [
+            { x: segment[0], y: segment[1] },
+            { x: segment[2], y: segment[3] },
+          ],
+          bounds,
+          width,
+          height
+        )
+      ),
+      ...edges.map((edge) => this._path(edge, bounds, width, height)),
+    ]
+      .filter(Boolean)
+      .join(" ");
+    // Lanes sit 100 mm apart; draw them a touch wider so they read as area.
+    const lanesWidth = Math.max(1, 110 * this._mapScale(bounds, width, height)).toFixed(2);
     const currentPoint = current ? this._project(current, bounds, width, height) : null;
     const currentHeading = current
       ? this._mowerHeading(current, charge, livePath, mowerState)
@@ -1234,6 +1292,8 @@ class EcovacsGoatCard extends HTMLElement {
       rtkMarkup,
       mowedAreaPath,
       liveSvgPath,
+      lanesSvgPath,
+      lanesWidth,
       currentPoint,
       currentHeading,
       markerAnimation,
@@ -1248,6 +1308,7 @@ class EcovacsGoatCard extends HTMLElement {
         ${render.gardenMarkup}
         ${render.obstacleMarkup}
         <path class="map-mowed-area"${render.mowedAreaPath ? ` d="${render.mowedAreaPath}"` : ""}></path>
+        <path class="map-mowed-lanes" stroke-width="${render.lanesWidth}"${render.lanesSvgPath ? ` d="${render.lanesSvgPath}"` : ""}></path>
         <path class="map-trail"${render.liveSvgPath ? ` d="${render.liveSvgPath}"` : ""}></path>
         ${render.stationMarkup}
         ${render.noGoMarkup}
@@ -1273,6 +1334,16 @@ class EcovacsGoatCard extends HTMLElement {
         mowed.setAttribute("d", render.mowedAreaPath);
       } else {
         mowed.removeAttribute("d");
+      }
+    }
+
+    const lanes = svg.querySelector(".map-mowed-lanes");
+    if (lanes) {
+      lanes.setAttribute("stroke-width", render.lanesWidth);
+      if (render.lanesSvgPath) {
+        lanes.setAttribute("d", render.lanesSvgPath);
+      } else {
+        lanes.removeAttribute("d");
       }
     }
 
@@ -1460,6 +1531,14 @@ class EcovacsGoatCard extends HTMLElement {
       return path[path.length - 2];
     }
     return null;
+  }
+
+  _mapScale(bounds, width, height) {
+    const padding = 4;
+    return Math.min(
+      (width - padding * 2) / (bounds.maxX - bounds.minX),
+      (height - padding * 2) / (bounds.maxY - bounds.minY)
+    );
   }
 
   _project(position, bounds, width, height) {

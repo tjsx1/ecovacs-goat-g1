@@ -11,6 +11,8 @@ POSITION_HISTORY_DENSE_TAIL_POINTS = 600
 TRACE_ATTRIBUTE_POINTS = 120
 OUTLINE_ATTRIBUTE_POINTS = 100
 OBSTACLE_ATTRIBUTE_POINTS = 24
+LAWN_ATTRIBUTE_POINTS = 240
+LANE_ATTRIBUTE_SEGMENTS = 900
 
 
 class MowerActivity(StrEnum):
@@ -150,11 +152,17 @@ class MowerMapTrace:
     type: str | None = None
     chunks: dict[int, str] = field(default_factory=dict)
     path: tuple[MapPosition, ...] = ()
+    # O-series (RTK) mowed track: straight lanes keyed by their lane id, each
+    # a tuple of (x1, y1, x2, y2) segments, plus edge-cut polylines.
+    lanes: dict[str, tuple[tuple[int, int, int, int], ...]] = field(
+        default_factory=dict
+    )
+    edges: tuple[tuple[MapPosition, ...], ...] = ()
 
     @property
     def complete(self) -> bool:
         """Return whether the received chunks look contiguous."""
-        if self.path:
+        if self.path or self.lanes:
             return True
         if not self.chunks:
             return False
@@ -175,6 +183,18 @@ class MowerMapTrace:
                 position.as_dict()
                 for position in _sample_positions(self.path, TRACE_ATTRIBUTE_POINTS)
             ],
+            # Compact on purpose: flat [x1, y1, x2, y2] lists keep a whole
+            # lawn's worth of lanes small enough for a state attribute.
+            "lanes": [
+                list(segment)
+                for _key, segments in sorted(
+                    self.lanes.items(), key=lambda item: _lane_sort_key(item[0])
+                )
+                for segment in segments
+            ][:LANE_ATTRIBUTE_SEGMENTS],
+            "edges": [
+                [[position.x, position.y] for position in edge] for edge in self.edges
+            ],
         }
 
 
@@ -189,6 +209,9 @@ class MowerMapInfo:
     chunks: dict[int, str] = field(default_factory=dict)
     outline: tuple[MapPosition, ...] = ()
     obstacles: tuple[tuple[MapPosition, ...], ...] = ()
+    # O-series (RTK) maps can hold several separate lawns; ``outline`` keeps
+    # the largest one for older cards, ``lawns`` has all of them.
+    lawns: tuple[tuple[MapPosition, ...], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -218,6 +241,13 @@ class MowerMapInfo:
                 ]
                 for obstacle in self.obstacles
             ],
+            "lawns": [
+                [
+                    position.as_dict()
+                    for position in _sample_positions(lawn, LAWN_ATTRIBUTE_POINTS)
+                ]
+                for lawn in self.lawns
+            ],
         }
 
 
@@ -237,6 +267,9 @@ class MowerMap:
     trace: MowerMapTrace = field(default_factory=MowerMapTrace)
     last_update_ts: int | None = None
     revision: int = 0
+    # Chunked O-series map pushes waiting for their remaining pieces, keyed by
+    # ``<command>:<batid>``. Internal only, never exported as an attribute.
+    pending_chunks: dict[str, dict[int, str]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         """Return a serialisable map snapshot."""
@@ -265,6 +298,17 @@ class MowerMap:
             "last_update_ts": self.last_update_ts,
             "revision": self.revision,
         }
+
+
+def _lane_sort_key(key: str) -> tuple[int, ...]:
+    """Sort lane keys like ``1:1:200`` numerically."""
+    parts: list[int] = []
+    for part in key.split(":"):
+        try:
+            parts.append(int(part))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
 
 
 def _sample_positions(
