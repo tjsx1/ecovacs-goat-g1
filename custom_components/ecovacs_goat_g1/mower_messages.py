@@ -159,13 +159,14 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         MowerActivity.UNKNOWN,
                         MowerActivity.MOWING,
                         MowerActivity.PAUSED,
+                        # The O1200 LiDAR Pro flips to idle for a few seconds
+                        # mid-job; that is no new run and must keep the trail.
+                        MowerActivity.IDLE,
                     }
                 ):
-                    mower_map = replace(
-                        mower_map,
-                        position_history=(),
-                        trace=replace(mower_map.trace, lanes={}, edges=()),
-                    )
+                    # Lanes are not cleared here: the mower sends a full lane
+                    # snapshot for the running job that replaces them anyway.
+                    mower_map = replace(mower_map, position_history=())
                 state = replace(
                     state,
                     activity=activity,
@@ -184,13 +185,14 @@ def apply_command_data(state: MowerState, command: str, data: Any) -> MowerState
                         MowerActivity.UNKNOWN,
                         MowerActivity.MOWING,
                         MowerActivity.PAUSED,
+                        # The O1200 LiDAR Pro flips to idle for a few seconds
+                        # mid-job; that is no new run and must keep the trail.
+                        MowerActivity.IDLE,
                     }
                 ):
-                    mower_map = replace(
-                        mower_map,
-                        position_history=(),
-                        trace=replace(mower_map.trace, lanes={}, edges=()),
-                    )
+                    # Lanes are not cleared here: the mower sends a full lane
+                    # snapshot for the running job that replaces them anyway.
+                    mower_map = replace(mower_map, position_history=())
                 state = replace(
                     state,
                     activity=activity,

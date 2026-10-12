@@ -78,6 +78,7 @@ def test_lawns_obstacles_and_lanes() -> None:
     assert len(state.map.trace.lanes) == 3
     exported = state.map.as_dict()
     assert len(exported["trace"]["lanes"]) == 4
+    assert exported["trace"]["lanes"][0] == [100, -900, 100, -500, 10]
     assert len(exported["info"]["lawns"]) == 2
 
 
@@ -105,3 +106,14 @@ def test_mow_area_schema_accepts_id_list_and_string() -> None:
     )
     assert schema({"areas": "1, 2"})["areas"] == ["1", "2"]
     assert schema({"areas": [2]})["areas"] == ["2"]
+
+
+def test_short_idle_mid_job_keeps_trail() -> None:
+    state = MowerState()
+    state = apply_command_data(state, "onCleanInfo", {"state": "clean", "cleanState": {"motionState": "working"}})
+    state = apply_command_data(state, "onPos", {"mid": "0", "deebotPos": {"x": 1, "y": 2}})
+    state = apply_command_data(state, "onPos", {"mid": "0", "deebotPos": {"x": 500, "y": 2}})
+    before = len(state.map.position_history)
+    state = apply_command_data(state, "onCleanInfo", {"state": "idle"})
+    state = apply_command_data(state, "onCleanInfo", {"state": "clean", "cleanState": {"motionState": "working"}})
+    assert len(state.map.position_history) == before

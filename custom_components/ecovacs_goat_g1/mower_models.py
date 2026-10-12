@@ -185,9 +185,11 @@ class MowerMapTrace:
             ],
             # Compact on purpose: flat [x1, y1, x2, y2] lists keep a whole
             # lawn's worth of lanes small enough for a state attribute.
+            # The fifth value is the lane number, so a card can alternate
+            # the colour lane by lane like real mowing stripes.
             "lanes": [
-                list(segment)
-                for _key, segments in sorted(
+                [*segment, _lane_sort_key(key)[-1]]
+                for key, segments in sorted(
                     self.lanes.items(), key=lambda item: _lane_sort_key(item[0])
                 )
                 for segment in segments
