@@ -231,6 +231,7 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
         self._saved_position_history: tuple[MapPosition, ...] = ()
         self._saved_outline: tuple[MapPosition, ...] = ()
         self._saved_obstacles: tuple[tuple[MapPosition, ...], ...] = ()
+        self._saved_rtk_layers: tuple[Any, ...] = ()
         self._mqtt = MowerMqttClient(
             api,
             device,
@@ -264,6 +265,19 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             self._saved_position_history = self.data.map.position_history
             self._saved_outline = self.data.map.info.outline
             self._saved_obstacles = self.data.map.info.obstacles
+        lawns, lanes, edges = await self._async_load_saved_rtk_layers()
+        if lawns or lanes or edges:
+            # O-series geometry only arrives while the mower drives; without
+            # this the map stays empty after every restart until the next mow.
+            self.data = replace(
+                self.data,
+                map=replace(
+                    self.data.map,
+                    info=replace(self.data.map.info, lawns=lawns),
+                    trace=replace(self.data.map.trace, lanes=lanes, edges=edges),
+                ),
+            )
+        self._saved_rtk_layers = self._rtk_layers(self.data)
         await self.async_config_entry_first_refresh()
         await self._mqtt.start()
         self._device_mqtt_ready = True
@@ -388,6 +402,48 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             ),
         )
 
+    async def _async_load_saved_rtk_layers(
+        self,
+    ) -> tuple[
+        tuple[tuple[MapPosition, ...], ...],
+        dict[str, tuple[tuple[int, int, int, int], ...]],
+        tuple[tuple[MapPosition, ...], ...],
+    ]:
+        """Restore O-series lawns and the last mowed lanes from HA storage."""
+        stored = await self._map_history_store.async_load()
+        if not isinstance(stored, dict):
+            return (), {}, ()
+        polygons = lambda items: tuple(  # noqa: E731
+            polygon
+            for item in (items if isinstance(items, list) else [])
+            if isinstance(item, list)
+            for polygon in (self._positions_from_stored(item),)
+            if polygon
+        )
+        lanes: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
+        raw_lanes = stored.get("lanes")
+        if isinstance(raw_lanes, dict):
+            for key, segments in raw_lanes.items():
+                if not isinstance(segments, list):
+                    continue
+                valid = tuple(
+                    (int(seg[0]), int(seg[1]), int(seg[2]), int(seg[3]))
+                    for seg in segments
+                    if isinstance(seg, list)
+                    and len(seg) == 4
+                    and all(isinstance(value, int) for value in seg)
+                )
+                if valid:
+                    lanes[str(key)] = valid
+        return polygons(stored.get("lawns")), lanes, polygons(stored.get("edges"))
+
+    @staticmethod
+    def _rtk_layers(data: MowerState | None) -> tuple[Any, ...]:
+        """Return the O-series layers that are worth persisting."""
+        if data is None:
+            return ((), {}, ())
+        return (data.map.info.lawns, data.map.trace.lanes, data.map.trace.edges)
+
     @staticmethod
     def _positions_from_stored(items: Any) -> tuple[MapPosition, ...]:
         """Return stored map points, ignoring malformed entries."""
@@ -407,12 +463,15 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             bool(data.map.info.outline)
             and data.map.info.outline != self._saved_outline
         )
+        rtk_layers = self._rtk_layers(data)
         if (
             data.map.position_history == self._saved_position_history
             and data.map.info.outline == self._saved_outline
             and data.map.info.obstacles == self._saved_obstacles
+            and rtk_layers == self._saved_rtk_layers
         ):
             return
+        self._saved_rtk_layers = rtk_layers
         self._saved_position_history = data.map.position_history
         self._saved_outline = data.map.info.outline
         self._saved_obstacles = data.map.info.obstacles
@@ -440,6 +499,18 @@ class MowerCoordinator(DataUpdateCoordinator[MowerState]):
             "outline": [position.as_dict() for position in outline],
             "obstacles": [
                 [position.as_dict() for position in polygon] for polygon in obstacles
+            ],
+            "lawns": [
+                [position.as_dict() for position in polygon]
+                for polygon in (map_state.info.lawns if map_state else ())
+            ],
+            "lanes": {
+                key: [list(segment) for segment in segments]
+                for key, segments in (map_state.trace.lanes if map_state else {}).items()
+            },
+            "edges": [
+                [position.as_dict() for position in polygon]
+                for polygon in (map_state.trace.edges if map_state else ())
             ],
         }
 
